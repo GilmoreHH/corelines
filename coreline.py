@@ -37,10 +37,75 @@ def get_stage_metadata():
     }
     return stages
 
-# Define core lines
+# Define business type categories
+def get_business_type_categories():
+    """Return a dictionary mapping business types to their consolidated categories."""
+    type_categories = {
+        # Commercial
+        "Bond": "Commercial",
+        "Builders Risk/Installation - CL": "Commercial",
+        "Bumbershoot": "Commercial",
+        "Business Owners": "Commercial",
+        "Commercial Auto": "Commercial",
+        "Commercial Package": "Commercial",
+        "Commercial Property": "Commercial",
+        "Commercial Umbrella": "Commercial",
+        "Crime": "Commercial",
+        "Cyber & Privacy Liability": "Commercial",
+        "Directors & Officers": "Commercial",
+        "Dwelling Fire CL": "Commercial",
+        "Errors and Omissions": "Commercial",
+        "Flood - CL": "Commercial",
+        "General Liability": "Commercial",
+        "Inland Marine CL": "Commercial",
+        "Marine Package": "Commercial",
+        "Surety": "Commercial",
+        "Workers Compensation": "Commercial",
+        "Employment Practices Liability": "Commercial",
+        "Liquor Liability": "Commercial",
+        "Wind Only - CL": "Commercial",
+        
+        # Homeowners
+        "Builders Risk/Installation - PL": "Homeowners",
+        "Dwelling Fire - PL": "Homeowners",
+        "Homeowners": "Homeowners",
+        "Mobile Homeowners": "Homeowners",
+        "Wind Only - PL": "Homeowners",
+        
+        # Marine
+        "Charter Watercraft": "Marine",
+        "Watercraft": "Marine",
+        "Yacht": "Marine",
+        
+        # Flood
+        "Flood - PL": "Flood",
+        
+        # Specialty Lines
+        "Golf Cart": "Specialty",
+        "Inland Marine PL": "Specialty",
+        "Motorcycle/ATV": "Specialty",
+        "Motorhome": "Specialty",
+        "Recreational Vehicle": "Specialty",
+        "Travel Trailer": "Specialty",
+        
+        # Life
+        "Life": "Life",
+        
+        # Auto
+        "Personal Auto": "Auto",
+        
+        # CPL/Excess CPL
+        "Personal Liability": "CPL",
+        
+        # Umbrella
+        "Umbrella": "Umbrella",
+    }
+    return type_categories
+
+# Define core lines (now includes all major categories)
 def get_core_lines():
     """Return a list of core lines for analysis."""
-    return ["Auto", "Flood", "Homeowners", "Umbrella"]
+    return ["Auto", "CPL", "Commercial", "Flood", "Homeowners", "Marine", "Specialty", "Umbrella"]
 
 # Function to connect to Salesforce and run SOQL queries
 def connect_to_salesforce(start_date=None, end_date=None):
@@ -53,8 +118,9 @@ def connect_to_salesforce(start_date=None, end_date=None):
             security_token=os.getenv("SF_SECURITY_TOKEN_PRO"),
         )
 
-        # Get stage metadata
+        # Get stage metadata and business type categories
         stage_metadata = get_stage_metadata()
+        business_type_categories = get_business_type_categories()
         
         # Prepare date filter
         date_filter = ""
@@ -93,7 +159,8 @@ def connect_to_salesforce(start_date=None, end_date=None):
                 AccountId,
                 Account.Name,
                 New_Business_or_Renewal__c,
-                CloseDate
+                CloseDate,
+                Renewal_Policy_Premium__c
             FROM Opportunity
             WHERE New_Business_or_Renewal__c IN ('Personal Lines - Renewal', 'Commercial Lines - Renewal')
             {date_filter}
@@ -115,14 +182,19 @@ def connect_to_salesforce(start_date=None, end_date=None):
             # Get stage category
             category = stage_metadata.get(stage_name, {"category": "Unknown"})["category"]
             
+            # Map business type to consolidated category
+            business_category = business_type_categories.get(business_type, "Other")
+            
             data.append({
                 'StageName': stage_name,
                 'StatusCategory': category,
                 'RenewalType': renewal_type,
                 'BusinessType': business_type,
+                'BusinessCategory': business_category,
                 'AccountManager': account_manager,
                 'CloseDate': record['CloseDate'],
-                'AccountName': record.get('Account', {}).get('Name', 'Unknown Account')
+                'AccountName': record.get('Account', {}).get('Name', 'Unknown Account'),
+                'Premium': float(record.get('Renewal_Policy_Premium__c', 0) or 0)
             })
         
         # Create DataFrame
@@ -134,9 +206,48 @@ def connect_to_salesforce(start_date=None, end_date=None):
         st.error(f"Error connecting to Salesforce: {str(e)}")
         return pd.DataFrame()
 
+# Calculate retention rates
+def calculate_retention_rates(df):
+    """Calculate retention rates by business category."""
+    retention_data = []
+    
+    for category in get_core_lines():
+        category_data = df[df['BusinessCategory'] == category]
+        
+        if len(category_data) > 0:
+            total_renewals = len(category_data)
+            won_renewals = len(category_data[category_data['StatusCategory'] == 'Won'])
+            lost_renewals = len(category_data[category_data['StatusCategory'] == 'Lost'])
+            open_renewals = len(category_data[category_data['StatusCategory'] == 'Open'])
+            
+            # Calculate retention rate based on closed opportunities only
+            closed_renewals = won_renewals + lost_renewals
+            retention_rate = (won_renewals / closed_renewals * 100) if closed_renewals > 0 else 0
+            # Calculate premium metrics
+            won_premium = category_data[category_data['StatusCategory'] == 'Won']['Premium'].sum()
+            lost_premium = category_data[category_data['StatusCategory'] == 'Lost']['Premium'].sum()
+            total_premium = category_data['Premium'].sum()
+            premium_retention_rate = (won_premium / (won_premium + lost_premium) * 100) if (won_premium + lost_premium) > 0 else 0
+            
+            retention_data.append({
+                'BusinessCategory': category,
+                'Total': total_renewals,
+                'Won': won_renewals,
+                'Lost': lost_renewals,
+                'Open': open_renewals,
+                'Closed': closed_renewals,
+                'RetentionRate': retention_rate,
+                'TotalPremium': total_premium,
+                'WonPremium': won_premium,
+                'LostPremium': lost_premium,
+                'PremiumRetentionRate': premium_retention_rate
+            })
+    
+    return pd.DataFrame(retention_data)
+
 # Streamlit UI
 st.title("🎯 Core Lines Renewal Performance Dashboard")
-st.markdown("**Focus Areas:** Win Rate Analysis & Workload Allocation for Strategic Decision Making")
+st.markdown("**Focus Areas:** Win Rate Analysis, Workload Allocation & Retention Performance")
 
 # Get current date
 today = datetime.datetime.today()
@@ -196,6 +307,14 @@ show_data_tables = st.sidebar.checkbox("Show Data Tables", value=True)
 min_opportunities = st.sidebar.slider("Minimum Opportunities for Win Rate Analysis", 
                                      min_value=1, max_value=10, value=3)
 
+# Business line filters
+st.sidebar.subheader("Business Line Filters")
+selected_lines = st.sidebar.multiselect(
+    "Select Business Lines",
+    options=get_core_lines(),
+    default=get_core_lines()
+)
+
 # Fetch data
 with st.spinner("Loading data from Salesforce..."):
     df = connect_to_salesforce(start_date, end_date)
@@ -204,16 +323,174 @@ if not df.empty:
     # Display reporting period
     st.info(f"📅 **Reporting Period:** {start_date.strftime('%B %d, %Y')} to {end_date.strftime('%B %d, %Y')}")
     
-    # Get core lines data
-    core_lines = get_core_lines()
+    # Apply business line filter
+    df_filtered = df[df['BusinessCategory'].isin(selected_lines)]
     
-    # Filter data for analysis
-    df_no_marine = df[~df['BusinessType'].str.contains('Marine', case=False, na=False)]
-    df_core = df[df['BusinessType'].isin(core_lines) & df['CloseDate'].notna()]
-    
-    if df_core.empty:
-        st.error("❌ No core lines data available for the selected date range.")
+    if df_filtered.empty:
+        st.error("❌ No data available for the selected business lines and date range.")
         st.stop()
+    
+    # === SECTION 1: RETENTION RATES BY BUSINESS LINE ===
+    st.header("📈 Retention Rates by Business Line")
+    
+    retention_df = calculate_retention_rates(df_filtered)
+    retention_df = retention_df[retention_df['Closed'] > 0].sort_values('RetentionRate', ascending=False)
+    
+    if not retention_df.empty:
+        # Retention Rate Chart
+        fig = px.bar(
+            retention_df,
+            x='BusinessCategory',
+            y='RetentionRate',
+            title='Retention Rate by Business Line (Closed Opportunities Only)',
+            color='RetentionRate',
+            color_continuous_scale='RdYlGn',
+            text='RetentionRate'
+        )
+        
+        fig.update_traces(
+            texttemplate='%{text:.1f}%',
+            textposition='outside'
+        )
+        
+        fig.update_layout(
+            xaxis_title='Business Line',
+            yaxis_title='Retention Rate (%)',
+            height=500,
+            yaxis=dict(range=[0, 100])
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Retention metrics
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            top_retention = retention_df.iloc[0]
+            st.metric(
+                "🏆 Highest Retention",
+                top_retention['BusinessCategory'],
+                f"{top_retention['RetentionRate']:.1f}%"
+            )
+        
+        with col2:
+            avg_retention = retention_df['RetentionRate'].mean()
+            st.metric(
+                "📊 Average Retention",
+                f"{avg_retention:.1f}%",
+                f"Across {len(retention_df)} lines"
+            )
+        
+        with col3:
+            total_closed = retention_df['Closed'].sum()
+            total_won = retention_df['Won'].sum()
+            st.metric(
+                "🎯 Overall Retention",
+                f"{(total_won/total_closed*100):.1f}%",
+                f"{total_won}/{total_closed} renewals"
+            )
+        
+        with col4:
+            lowest_retention = retention_df.iloc[-1]
+            st.metric(
+                "⚠️ Lowest Retention",
+                lowest_retention['BusinessCategory'],
+                f"{lowest_retention['RetentionRate']:.1f}%"
+            )
+        # Premium-based metrics
+        st.subheader("💰 Premium Retention Analysis")
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            total_premium_at_risk = retention_df['TotalPremium'].sum()
+            st.metric(
+                "💼 Total Premium",
+                f"${total_premium_at_risk:,.0f}",
+                "All renewal opportunities"
+            )
+        
+        with col2:
+            retained_premium = retention_df['WonPremium'].sum()
+            st.metric(
+                "✅ Retained Premium",
+                f"${retained_premium:,.0f}",
+                f"{retained_premium/total_premium_at_risk*100:.1f}% of total" if total_premium_at_risk > 0 else "0%"
+            )
+        
+        with col3:
+            lost_premium = retention_df['LostPremium'].sum()
+            st.metric(
+                "❌ Lost Premium",
+                f"${lost_premium:,.0f}",
+                f"{lost_premium/total_premium_at_risk*100:.1f}% of total" if total_premium_at_risk > 0 else "0%"
+            )
+        
+        with col4:
+            overall_premium_retention = (retained_premium / (retained_premium + lost_premium) * 100) if (retained_premium + lost_premium) > 0 else 0
+            st.metric(
+                "🎯 Premium Retention Rate",
+                f"{overall_premium_retention:.1f}%",
+                "Closed opportunities only"
+            )
+        # Detailed retention breakdown chart
+        fig2 = go.Figure()
+        
+        # Add bars for Won, Lost, and Open
+        fig2.add_trace(go.Bar(
+            name='Won (Retained)',
+            x=retention_df['BusinessCategory'],
+            y=retention_df['Won'],
+            marker_color='green',
+            text=retention_df['Won'],
+            textposition='auto'
+        ))
+        
+        fig2.add_trace(go.Bar(
+            name='Lost',
+            x=retention_df['BusinessCategory'],
+            y=retention_df['Lost'],
+            marker_color='red',
+            text=retention_df['Lost'],
+            textposition='auto'
+        ))
+        
+        fig2.add_trace(go.Bar(
+            name='Open',
+            x=retention_df['BusinessCategory'],
+            y=retention_df['Open'],
+            marker_color='orange',
+            text=retention_df['Open'],
+            textposition='auto'
+        ))
+        
+        fig2.update_layout(
+            title='Renewal Status Breakdown by Business Line',
+            xaxis_title='Business Line',
+            yaxis_title='Number of Opportunities',
+            barmode='stack',
+            height=500
+        )
+        
+        st.plotly_chart(fig2, use_container_width=True)
+        
+        # Show retention table
+        if show_data_tables:
+            st.subheader("📋 Detailed Retention Analysis")
+            display_retention = retention_df.copy()
+            display_retention['RetentionRate'] = display_retention['RetentionRate'].round(1)
+            
+            # Select only the original columns for display
+            display_columns = ['BusinessCategory', 'Total', 'Won', 'Lost', 'Open', 'Closed', 'RetentionRate']
+            display_retention_filtered = display_retention[display_columns]
+            
+            display_retention_filtered.columns = [
+                'Business Line', 'Total Opps', 'Won', 'Lost', 'Open', 
+                'Closed Opps', 'Retention Rate (%)'
+            ]
+            st.dataframe(display_retention_filtered, use_container_width=True)
+    
+    # === SECTION 2: WIN RATE COMPARISON ===
+    st.header("🏆 Win Rate Performance: Core Lines vs All Lines")
     
     # Calculate metrics for both datasets
     def calculate_win_rates(dataframe):
@@ -233,121 +510,123 @@ if not df.empty:
         
         return am_pivot
     
-    # Calculate win rates for both datasets
-    all_lines_rates = calculate_win_rates(df_no_marine)
-    core_lines_rates = calculate_win_rates(df_core)
+    # Filter data for analysis (exclude marine from "all lines" comparison)
+    df_no_marine = df_filtered[df_filtered['BusinessCategory'] != 'Marine']
+    df_core = df_filtered[df_filtered['CloseDate'].notna()]
     
-    # === SECTION 1: WIN RATE COMPARISON ===
-    st.header("🏆 Win Rate Performance: Core Lines vs All Lines")
-    
-    # Create comparison data
-    comparison_data = []
-    common_managers = set(all_lines_rates.index) & set(core_lines_rates.index)
-    
-    for manager in common_managers:
-        all_closed = all_lines_rates.loc[manager, 'Won'] + all_lines_rates.loc[manager, 'Lost']
-        core_closed = core_lines_rates.loc[manager, 'Won'] + core_lines_rates.loc[manager, 'Lost']
+    if not df_core.empty:
+        # Calculate win rates for both datasets
+        all_lines_rates = calculate_win_rates(df_no_marine)
+        core_lines_rates = calculate_win_rates(df_core)
         
-        if all_closed >= min_opportunities and core_closed >= min_opportunities:
-            comparison_data.append({
-                'AccountManager': manager,
-                'All_Lines_Win_Rate': all_lines_rates.loc[manager, 'Win_Rate'],
-                'Core_Lines_Win_Rate': core_lines_rates.loc[manager, 'Win_Rate'],
-                'Difference': core_lines_rates.loc[manager, 'Win_Rate'] - all_lines_rates.loc[manager, 'Win_Rate'],
-                'All_Lines_Total': int(all_lines_rates.loc[manager, 'Total']),
-                'Core_Lines_Total': int(core_lines_rates.loc[manager, 'Total'])
-            })
-    
-    if comparison_data:
-        comparison_df = pd.DataFrame(comparison_data)
-        comparison_df = comparison_df.sort_values('Core_Lines_Win_Rate', ascending=False)
+        # Create comparison data
+        comparison_data = []
+        common_managers = set(all_lines_rates.index) & set(core_lines_rates.index)
         
-        # Win Rate Comparison Chart
-        fig = go.Figure()
-        
-        fig.add_trace(go.Bar(
-            name='All Lines (Exc. Marine)',
-            x=comparison_df['AccountManager'],
-            y=comparison_df['All_Lines_Win_Rate'],
-            marker_color='#3498db',
-            text=comparison_df['All_Lines_Win_Rate'].round(1),
-            textposition='auto',
-        ))
-        
-        fig.add_trace(go.Bar(
-            name='Core Lines Only',
-            x=comparison_df['AccountManager'],
-            y=comparison_df['Core_Lines_Win_Rate'],
-            marker_color='#e74c3c',
-            text=comparison_df['Core_Lines_Win_Rate'].round(1),
-            textposition='auto',
-        ))
-        
-        fig.update_layout(
-            title='Win Rate Comparison: All Lines vs Core Lines Performance',
-            xaxis_title='Account Manager',
-            yaxis_title='Win Rate (%)',
-            barmode='group',
-            height=500,
-            showlegend=True
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Key Insights
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            top_performer = comparison_df.iloc[0]
-            st.metric(
-                "🥇 Top Core Lines Performer", 
-                top_performer['AccountManager'],
-                f"{top_performer['Core_Lines_Win_Rate']:.1f}%"
-            )
-        
-        with col2:
-            avg_core_rate = comparison_df['Core_Lines_Win_Rate'].mean()
-            avg_all_rate = comparison_df['All_Lines_Win_Rate'].mean()
-            st.metric(
-                "📊 Average Core Lines Win Rate",
-                f"{avg_core_rate:.1f}%",
-                f"{avg_core_rate - avg_all_rate:+.1f}% vs All Lines"
-            )
-        
-        with col3:
-            best_improvement = comparison_df.loc[comparison_df['Difference'].idxmax()]
-            st.metric(
-                "📈 Biggest Core Lines Advantage",
-                best_improvement['AccountManager'],
-                f"+{best_improvement['Difference']:.1f}%"
-            )
-        
-        # Show comparison table
-        if show_data_tables:
-            st.subheader("📋 Detailed Win Rate Comparison")
-            display_comparison = comparison_df.copy()
-            display_comparison['All_Lines_Win_Rate'] = display_comparison['All_Lines_Win_Rate'].round(1)
-            display_comparison['Core_Lines_Win_Rate'] = display_comparison['Core_Lines_Win_Rate'].round(1)
-            display_comparison['Difference'] = display_comparison['Difference'].round(1)
+        for manager in common_managers:
+            all_closed = all_lines_rates.loc[manager, 'Won'] + all_lines_rates.loc[manager, 'Lost']
+            core_closed = core_lines_rates.loc[manager, 'Won'] + core_lines_rates.loc[manager, 'Lost']
             
-            display_comparison.columns = [
-                'Account Manager', 'All Lines Win Rate (%)', 'Core Lines Win Rate (%)', 
-                'Difference (%)', 'All Lines Total Opps', 'Core Lines Total Opps'
-            ]
-            st.dataframe(display_comparison, use_container_width=True)
-    else:
-        st.warning(f"⚠️ Not enough data for win rate comparison (minimum {min_opportunities} opportunities required).")
+            if all_closed >= min_opportunities and core_closed >= min_opportunities:
+                comparison_data.append({
+                    'AccountManager': manager,
+                    'All_Lines_Win_Rate': all_lines_rates.loc[manager, 'Win_Rate'],
+                    'Core_Lines_Win_Rate': core_lines_rates.loc[manager, 'Win_Rate'],
+                    'Difference': core_lines_rates.loc[manager, 'Win_Rate'] - all_lines_rates.loc[manager, 'Win_Rate'],
+                    'All_Lines_Total': int(all_lines_rates.loc[manager, 'Total']),
+                    'Core_Lines_Total': int(core_lines_rates.loc[manager, 'Total'])
+                })
+        
+        if comparison_data:
+            comparison_df = pd.DataFrame(comparison_data)
+            comparison_df = comparison_df.sort_values('Core_Lines_Win_Rate', ascending=False)
+            
+            # Win Rate Comparison Chart
+            fig = go.Figure()
+            
+            fig.add_trace(go.Bar(
+                name='All Lines (Exc. Marine)',
+                x=comparison_df['AccountManager'],
+                y=comparison_df['All_Lines_Win_Rate'],
+                marker_color='#3498db',
+                text=comparison_df['All_Lines_Win_Rate'].round(1),
+                textposition='auto',
+            ))
+            
+            fig.add_trace(go.Bar(
+                name='Selected Lines',
+                x=comparison_df['AccountManager'],
+                y=comparison_df['Core_Lines_Win_Rate'],
+                marker_color='#e74c3c',
+                text=comparison_df['Core_Lines_Win_Rate'].round(1),
+                textposition='auto',
+            ))
+            
+            fig.update_layout(
+                title='Win Rate Comparison: All Lines vs Selected Lines Performance',
+                xaxis_title='Account Manager',
+                yaxis_title='Win Rate (%)',
+                barmode='group',
+                height=500,
+                showlegend=True
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Key Insights
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                top_performer = comparison_df.iloc[0]
+                st.metric(
+                    "🥇 Top Performer", 
+                    top_performer['AccountManager'],
+                    f"{top_performer['Core_Lines_Win_Rate']:.1f}%"
+                )
+            
+            with col2:
+                avg_core_rate = comparison_df['Core_Lines_Win_Rate'].mean()
+                avg_all_rate = comparison_df['All_Lines_Win_Rate'].mean()
+                st.metric(
+                    "📊 Average Win Rate",
+                    f"{avg_core_rate:.1f}%",
+                    f"{avg_core_rate - avg_all_rate:+.1f}% vs All Lines"
+                )
+            
+            with col3:
+                best_improvement = comparison_df.loc[comparison_df['Difference'].idxmax()]
+                st.metric(
+                    "📈 Biggest Advantage",
+                    best_improvement['AccountManager'],
+                    f"+{best_improvement['Difference']:.1f}%"
+                )
+            
+            # Show comparison table
+            if show_data_tables:
+                st.subheader("📋 Detailed Win Rate Comparison")
+                display_comparison = comparison_df.copy()
+                display_comparison['All_Lines_Win_Rate'] = display_comparison['All_Lines_Win_Rate'].round(1)
+                display_comparison['Core_Lines_Win_Rate'] = display_comparison['Core_Lines_Win_Rate'].round(1)
+                display_comparison['Difference'] = display_comparison['Difference'].round(1)
+                
+                display_comparison.columns = [
+                    'Account Manager', 'All Lines Win Rate (%)', 'Selected Lines Win Rate (%)', 
+                    'Difference (%)', 'All Lines Total Opps', 'Selected Lines Total Opps'
+                ]
+                st.dataframe(display_comparison, use_container_width=True)
+        else:
+            st.warning(f"⚠️ Not enough data for win rate comparison (minimum {min_opportunities} opportunities required).")
     
-    # === SECTION 2: WORKLOAD ALLOCATION ===
-    st.header("⚖️ Core Lines Workload Allocation Analysis")
-    st.info("📝 **Weighting System:** Flood policies = 0.5 weight, All other core lines = 1.0 weight")
+    # === SECTION 3: WORKLOAD ALLOCATION ===
+    st.header("⚖️ Workload Allocation Analysis")
+    st.info("📝 **Weighting System:** Flood policies = 0.5 weight, All other lines = 1.0 weight")
     
     # Prepare workload data
-    df_core_workload = df_core.copy()
-    df_core_workload['CloseDate'] = pd.to_datetime(df_core_workload['CloseDate'])
+    df_workload = df_filtered.copy()
+    df_workload['CloseDate'] = pd.to_datetime(df_workload['CloseDate'])
     
     # Apply weighting: Flood = 0.5, others = 1.0
-    df_core_workload['WeightedCount'] = df_core_workload['BusinessType'].apply(
+    df_workload['WeightedCount'] = df_workload['BusinessCategory'].apply(
         lambda x: 0.5 if x == 'Flood' else 1.0
     )
     
@@ -356,23 +635,23 @@ if not df.empty:
     
     if date_diff <= 31:
         if date_diff <= 7:
-            df_core_workload['TimeGroup'] = df_core_workload['CloseDate'].dt.strftime('%Y-%m-%d')
+            df_workload['TimeGroup'] = df_workload['CloseDate'].dt.strftime('%Y-%m-%d')
             time_label = "Day"
         else:
-            df_core_workload['TimeGroup'] = df_core_workload['CloseDate'].dt.strftime('%Y-W%U')
+            df_workload['TimeGroup'] = df_workload['CloseDate'].dt.strftime('%Y-W%U')
             time_label = "Week"
     elif date_diff <= 365:
-        df_core_workload['TimeGroup'] = df_core_workload['CloseDate'].dt.strftime('%Y-%m')
+        df_workload['TimeGroup'] = df_workload['CloseDate'].dt.strftime('%Y-%m')
         time_label = "Month"
     else:
-        df_core_workload['TimeGroup'] = df_core_workload['CloseDate'].dt.to_period('Q').astype(str)
+        df_workload['TimeGroup'] = df_workload['CloseDate'].dt.to_period('Q').astype(str)
         time_label = "Quarter"
     
     # Calculate workload by Account Manager and Time Period
-    workload_summary = df_core_workload.groupby(['AccountManager', 'TimeGroup', 'BusinessType']).agg({
-        'BusinessType': 'count',  # Count of opportunities
+    workload_summary = df_workload.groupby(['AccountManager', 'TimeGroup', 'BusinessCategory']).agg({
+        'BusinessCategory': 'count',  # Count of opportunities
         'WeightedCount': 'first'  # Get the weight
-    }).rename(columns={'BusinessType': 'Count'})
+    }).rename(columns={'BusinessCategory': 'Count'})
     
     # Apply the weighting
     workload_summary['WeightedCount'] = workload_summary['Count'] * workload_summary['WeightedCount']
@@ -390,7 +669,7 @@ if not df.empty:
         x="TimeGroup",
         y="WeightedCount",
         color="AccountManager",
-        title=f"Core Lines Workload Distribution by {time_label} (Weighted)",
+        title=f"Workload Distribution by {time_label} (Weighted)",
         barmode="group",
         height=500
     )
@@ -430,12 +709,13 @@ if not df.empty:
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        highest_workload = am_summary.iloc[0]
-        st.metric(
-            "🔥 Highest Workload",
-            highest_workload['Account Manager'],
-            f"{highest_workload['Weighted Total']:.0f} policies"
-        )
+        if len(am_summary) > 0:
+            highest_workload = am_summary.iloc[0]
+            st.metric(
+                "🔥 Highest Workload",
+                highest_workload['Account Manager'],
+                f"{highest_workload['Weighted Total']:.0f} policies"
+            )
     
     with col2:
         total_reduction = am_summary['Workload Reduction'].sum()
@@ -454,56 +734,15 @@ if not df.empty:
         )
     
     with col4:
-        flood_policies = len(df_core[df_core['BusinessType'] == 'Flood'])
+        flood_policies = len(df_filtered[df_filtered['BusinessCategory'] == 'Flood'])
         st.metric(
             "🌊 Flood Policies",
             f"{flood_policies}",
             f"Weighted as {flood_policies * 0.5:.0f}"
         )
     
-    # Detailed workload breakdown
+    # Show workload breakdown table
     if show_data_tables:
-        st.subheader(f"📋 Detailed Workload Breakdown by {time_label}")
-        
-        # Create comprehensive breakdown
-        detailed_breakdown = []
-        
-        for (manager, time_period), period_data in workload_summary.groupby(['AccountManager', 'TimeGroup']):
-            row = {
-                'Account Manager': manager,
-                time_label: time_period,
-                'Auto': 0, 'Flood': 0, 'Homeowners': 0, 'Umbrella': 0
-            }
-            
-            # Fill in actual values
-            for _, line_data in period_data.iterrows():
-                line_type = line_data['BusinessType']
-                count = line_data['Count']
-                
-                if line_type in ['Auto', 'Flood', 'Homeowners', 'Umbrella']:
-                    row[line_type] = count
-            
-            # Calculate totals
-            row['Total_Count'] = sum([row['Auto'], row['Flood'], row['Homeowners'], row['Umbrella']])
-            row['Weighted_Total'] = row['Auto'] + (row['Flood'] * 0.5) + row['Homeowners'] + row['Umbrella']
-            
-            detailed_breakdown.append(row)
-        
-        if detailed_breakdown:
-            detailed_df = pd.DataFrame(detailed_breakdown)
-            detailed_df = detailed_df.sort_values([time_label, 'Account Manager'])
-            
-            # Format for display
-            display_cols = ['Account Manager', time_label, 'Homeowners', 'Flood', 'Auto', 'Umbrella', 'Total_Count', 'Weighted_Total']
-            detailed_display = detailed_df[display_cols].copy()
-            detailed_display.columns = ['Account Manager', time_label, 'Home', 'Flood', 'Auto', 'Umbrella', 'Total Count', 'Weighted Total']
-            
-            st.dataframe(detailed_display, use_container_width=True)
-            
-            # Show calculation example
-            st.success("💡 **Example:** If John has Home: 100, Flood: 200, Auto: 150, Umbrella: 50 → Weighted Total = 400 (500 total - 100 reduction from Flood)")
-        
-        # Overall summary table
         st.subheader("📊 Overall Account Manager Summary")
         st.dataframe(am_summary, use_container_width=True)
 
@@ -519,5 +758,5 @@ else:
 
 # Footer
 st.markdown("---")
-st.markdown("**Dashboard Focus:** Core Lines (Auto, Flood, Homeowners, Umbrella) Performance Analysis")
-st.markdown("🎯 Designed for strategic decision-making on renewal performance and workload distribution")
+st.markdown("**Dashboard Focus:** Comprehensive Business Line Performance Analysis")
+st.markdown("🎯 Designed for strategic decision-making on renewal performance, retention rates, and workload distribution")
